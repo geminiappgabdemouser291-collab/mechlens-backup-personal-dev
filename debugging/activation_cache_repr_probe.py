@@ -1,4 +1,6 @@
-"""Probe ActivationCache repr/display cost with fixed keys and growing tensor sizes.
+"""Probe ActivationCache repr/display cost along both dimensions:
+1. Fixed keys, growing tensor sizes
+2. Fixed tensor size, growing key counts
 
 Imports the real ``ActivationCache`` from this checkout (not a stub) and compares:
 - ``repr(cache)``, ``str(cache)``, and IPython ``pretty(cache)`` on ``ActivationCache``
@@ -6,8 +8,8 @@ Imports the real ``ActivationCache`` from this checkout (not a stub) and compare
 
 Examples:
     python debugging/activation_cache_repr_probe.py
-    python debugging/activation_cache_repr_probe.py --device cuda --layers 32
-    python debugging/activation_cache_repr_probe.py --shapes 1x4x8 2x128x768 4x256x1024
+    python debugging/activation_cache_repr_probe.py --device cuda
+    python debugging/activation_cache_repr_probe.py --mode keys --layer-counts 12 32 80 126 256
 """
 
 from __future__ import annotations
@@ -65,6 +67,9 @@ DEFAULT_SHAPES: Tuple[Tuple[int, ...], ...] = (
     (4, 256, 1024),
 )
 
+DEFAULT_LAYER_COUNTS: Tuple[int, ...] = (12, 32, 80, 126, 256)
+DEFAULT_KEY_SWEEP_SHAPE = "1x32x256"
+
 DTYPE_MAP: Dict[str, torch.dtype] = {
     "float32": torch.float32,
     "float16": torch.float16,
@@ -73,7 +78,7 @@ DTYPE_MAP: Dict[str, torch.dtype] = {
 
 
 def build_hook_keys(n_layers: int) -> List[str]:
-    """Build a fixed HookedTransformer-style key list for ``n_layers`` blocks."""
+    """Build a realistic HookedTransformer-style key list for ``n_layers`` blocks."""
     keys = ["hook_embed", "hook_pos_embed"]
     for layer in range(n_layers):
         for hook_name in PER_LAYER_HOOKS:
@@ -122,28 +127,143 @@ def time_fn(fn: Callable[[], str], device: torch.device, repeats: int) -> Tuple[
     return times_ms[len(times_ms) // 2], out_len
 
 
+def parse_shape(spec: str) -> Tuple[int, ...]:
+    dims = tuple(int(part.strip()) for part in spec.split("x"))
+    if not dims or any(d <= 0 for d in dims):
+        raise ValueError(f"Invalid shape {spec!r}; expected e.g. 2x128x768")
+    return dims
+
+
 def parse_shapes(raw_shapes: Optional[List[str]]) -> List[Tuple[int, ...]]:
     if not raw_shapes:
         return list(DEFAULT_SHAPES)
-    parsed: List[Tuple[int, ...]] = []
-    for spec in raw_shapes:
-        dims = tuple(int(part.strip()) for part in spec.split("x"))
-        if not dims or any(d <= 0 for d in dims):
-            raise ValueError(f"Invalid shape {spec!r}; expected e.g. 2x128x768")
-        parsed.append(dims)
-    return parsed
+    return [parse_shape(spec) for spec in raw_shapes]
+
+
+def measure_row(
+    keys: List[str],
+    shape: Tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    repeats: int,
+    skip_dict_repr: bool,
+) -> Dict[str, str]:
+    """Build a real ActivationCache, measure all display paths, then release memory."""
+    cache = make_cache(keys, shape=shape, dtype=dtype, device=device)
+    mem_mb = cache_tensor_bytes(cache) / (1024.0 * 1024.0)
+
+    repr_ms, repr_len = time_fn(lambda: repr(cache), device, repeats)
+    str_ms, _ = time_fn(lambda: str(cache), device, repeats)
+    if ipython_pretty is not None:
+        pretty_ms, _ = time_fn(lambda: ipython_pretty(cache), device, repeats)
+        pretty_col = f"{pretty_ms:9.3f}"
+    else:
+        pretty_col = f"{'n/a':>9}"
+
+    if skip_dict_repr:
+        dict_ms_col, dict_len_col = f"{'skipped':>9}", f"{'skipped':>10}"
+    else:
+        dict_ms, dict_len = time_fn(lambda: repr(cache.cache_dict), device, repeats)
+        dict_ms_col, dict_len_col = f"{dict_ms:9.3f}", f"{dict_len:10d}"
+
+    del cache
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    return {
+        "mem_mb": f"{mem_mb:10.2f}",
+        "repr_ms": f"{repr_ms:8.3f}",
+        "str_ms": f"{str_ms:8.3f}",
+        "pretty_ms": pretty_col,
+        "repr_len": f"{repr_len:10d}",
+        "dict_ms": dict_ms_col,
+        "dict_len": dict_len_col,
+    }
+
+
+def run_tensor_size_sweep(
+    n_layers: int,
+    shapes: List[Tuple[int, ...]],
+    dtype: torch.dtype,
+    device: torch.device,
+    repeats: int,
+    skip_dict_repr: bool,
+) -> None:
+    keys = build_hook_keys(n_layers)
+    print(f"=== Sweep 1: Fixed keys ({len(keys)} keys, {n_layers} layers), growing tensor sizes ===")
+    header = (
+        f"{'shape':<14} | {'tensors MB':>10} | {'repr ms':>8} | {'str ms':>8} | "
+        f"{'pretty ms':>9} | {'repr chars':>10} | {'dict ms':>9} | {'dict chars':>10}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for shape in shapes:
+        row = measure_row(keys, shape, dtype, device, repeats, skip_dict_repr)
+        shape_str = "x".join(str(d) for d in shape)
+        print(
+            f"{shape_str:<14} | {row['mem_mb']} | {row['repr_ms']} | {row['str_ms']} | "
+            f"{row['pretty_ms']} | {row['repr_len']} | {row['dict_ms']} | {row['dict_len']}"
+        )
+    print()
+
+
+def run_key_count_sweep(
+    layer_counts: List[int],
+    fixed_shape: Tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    repeats: int,
+    skip_dict_repr: bool,
+) -> None:
+    shape_str = "x".join(str(d) for d in fixed_shape)
+    print(f"=== Sweep 2: Fixed tensor size ({shape_str}), growing key counts ===")
+    header = (
+        f"{'layers':>6} | {'keys':>6} | {'tensors MB':>10} | {'repr ms':>8} | {'str ms':>8} | "
+        f"{'pretty ms':>9} | {'repr chars':>10} | {'dict ms':>9} | {'dict chars':>10}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for n_layers in layer_counts:
+        keys = build_hook_keys(n_layers)
+        row = measure_row(keys, fixed_shape, dtype, device, repeats, skip_dict_repr)
+        print(
+            f"{n_layers:6d} | {len(keys):6d} | {row['mem_mb']} | {row['repr_ms']} | {row['str_ms']} | "
+            f"{row['pretty_ms']} | {row['repr_len']} | {row['dict_ms']} | {row['dict_len']}"
+        )
+    print()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Probe real ActivationCache repr/display with fixed keys and bigger tensors."
+        description="Probe real ActivationCache repr/display along tensor-size and key-count sweeps."
     )
-    parser.add_argument("--layers", type=int, default=12, help="Number of layers (default: 12)")
+    parser.add_argument(
+        "--mode",
+        choices=("both", "tensors", "keys"),
+        default="both",
+        help="Which sweep(s) to run (default: both)",
+    )
+    parser.add_argument("--layers", type=int, default=12, help="Fixed layers for tensor sweep (default: 12)")
     parser.add_argument(
         "--shapes",
         nargs="+",
         default=None,
-        help="Tensor shapes as DxDxD (e.g. 1x4x8 1x32x256 2x128x768 4x256x1024)",
+        help="Tensor shapes as DxDxD for tensor sweep (e.g. 1x4x8 1x32x256 2x128x768 4x256x1024)",
+    )
+    parser.add_argument(
+        "--layer-counts",
+        nargs="+",
+        type=int,
+        default=list(DEFAULT_LAYER_COUNTS),
+        help="Layer counts for key-count sweep (default: 12 32 80 126 256)",
+    )
+    parser.add_argument(
+        "--key-sweep-shape",
+        default=DEFAULT_KEY_SWEEP_SHAPE,
+        help=f"Fixed tensor shape for key-count sweep (default: {DEFAULT_KEY_SWEEP_SHAPE})",
     )
     parser.add_argument("--dtype", choices=sorted(DTYPE_MAP), default="float32")
     parser.add_argument("--device", default="cpu", help="Torch device (default: cpu)")
@@ -163,49 +283,32 @@ def main() -> None:
     device = torch.device(args.device)
     dtype = DTYPE_MAP[args.dtype]
     shapes = parse_shapes(args.shapes)
-    keys = build_hook_keys(args.layers)
+    key_sweep_shape = parse_shape(args.key_sweep_shape)
 
     print(f"ActivationCache source : {inspect.getsourcefile(ActivationCache)}")
     print(f"torch version          : {torch.__version__} (device={device}, dtype={dtype})")
     print(f"IPython pretty         : {'available' if ipython_pretty is not None else 'not installed'}")
-    print(f"Fixed key count        : {len(keys)} ({args.layers} layers)")
     print()
 
-    header = (
-        f"{'shape':<14} | {'tensors MB':>10} | {'repr ms':>8} | {'str ms':>8} | "
-        f"{'pretty ms':>9} | {'repr chars':>10} | {'dict ms':>9} | {'dict chars':>10}"
-    )
-    print(header)
-    print("-" * len(header))
-
-    for shape in shapes:
-        cache = make_cache(keys, shape=shape, dtype=dtype, device=device)
-        mem_mb = cache_tensor_bytes(cache) / (1024.0 * 1024.0)
-
-        repr_ms, repr_len = time_fn(lambda: repr(cache), device, args.repeats)
-        str_ms, _ = time_fn(lambda: str(cache), device, args.repeats)
-        if ipython_pretty is not None:
-            pretty_ms, _ = time_fn(lambda: ipython_pretty(cache), device, args.repeats)
-            pretty_col = f"{pretty_ms:9.3f}"
-        else:
-            pretty_col = f"{'n/a':>9}"
-
-        if args.skip_dict_repr:
-            dict_ms_col, dict_len_col = f"{'skipped':>9}", f"{'skipped':>10}"
-        else:
-            dict_ms, dict_len = time_fn(lambda: repr(cache.cache_dict), device, args.repeats)
-            dict_ms_col, dict_len_col = f"{dict_ms:9.3f}", f"{dict_len:10d}"
-
-        shape_str = "x".join(str(d) for d in shape)
-        print(
-            f"{shape_str:<14} | {mem_mb:10.2f} | {repr_ms:8.3f} | {str_ms:8.3f} | "
-            f"{pretty_col} | {repr_len:10d} | {dict_ms_col} | {dict_len_col}"
+    if args.mode in ("both", "tensors"):
+        run_tensor_size_sweep(
+            n_layers=args.layers,
+            shapes=shapes,
+            dtype=dtype,
+            device=device,
+            repeats=args.repeats,
+            skip_dict_repr=args.skip_dict_repr,
         )
 
-        del cache
-        gc.collect()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+    if args.mode in ("both", "keys"):
+        run_key_count_sweep(
+            layer_counts=args.layer_counts,
+            fixed_shape=key_sweep_shape,
+            dtype=dtype,
+            device=device,
+            repeats=args.repeats,
+            skip_dict_repr=args.skip_dict_repr,
+        )
 
 
 if __name__ == "__main__":
