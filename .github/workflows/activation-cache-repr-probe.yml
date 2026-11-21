@@ -27,12 +27,9 @@ jobs:
         id: deps
         run: uv sync
 
-      - name: Format check (pycln, isort, black)
+      - name: Format check (make check-format)
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
-        run: |
-          uv run pycln --check .
-          uv run isort --check .
-          uv run black --check --diff .
+        run: make check-format
 
       - name: Type check (mypy)
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
