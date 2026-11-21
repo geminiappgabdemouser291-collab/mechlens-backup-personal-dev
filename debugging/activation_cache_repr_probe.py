@@ -20,7 +20,7 @@ import inspect
 import sys
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Prefer this checkout over any globally installed transformer_lens package.
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -31,10 +31,13 @@ import torch  # noqa: E402
 
 from transformer_lens.ActivationCache import ActivationCache  # noqa: E402
 
+ipython_pretty: Optional[Callable[..., Any]] = None
 try:
-    from IPython.lib.pretty import pretty as ipython_pretty
+    from IPython.lib.pretty import pretty as _ipython_pretty
 except ImportError:
-    ipython_pretty = None
+    pass
+else:
+    ipython_pretty = _ipython_pretty
 
 PER_LAYER_HOOKS: Tuple[str, ...] = (
     "hook_resid_pre",
@@ -155,7 +158,8 @@ def measure_row(
     repr_ms, repr_len = time_fn(lambda: repr(cache), device, repeats)
     str_ms, _ = time_fn(lambda: str(cache), device, repeats)
     if ipython_pretty is not None:
-        pretty_ms, _ = time_fn(lambda: ipython_pretty(cache), device, repeats)
+        pretty_fn = ipython_pretty
+        pretty_ms, _ = time_fn(lambda: str(pretty_fn(cache)), device, repeats)
         pretty_col = f"{pretty_ms:9.3f}"
     else:
         pretty_col = f"{'n/a':>9}"
@@ -191,7 +195,7 @@ def run_tensor_size_sweep(
     skip_dict_repr: bool,
 ) -> None:
     keys = build_hook_keys(n_layers)
-    print(f"=== Sweep 1: Fixed keys ({len(keys)} keys, {n_layers} layers), growing tensor sizes ===")
+    print(f"=== Sweep 1: Fixed keys ({len(keys)} keys, {n_layers} layers), growing tensors ===")
     header = (
         f"{'shape':<14} | {'tensors MB':>10} | {'repr ms':>8} | {'str ms':>8} | "
         f"{'pretty ms':>9} | {'repr chars':>10} | {'dict ms':>9} | {'dict chars':>10}"
@@ -229,16 +233,18 @@ def run_key_count_sweep(
     for n_layers in layer_counts:
         keys = build_hook_keys(n_layers)
         row = measure_row(keys, fixed_shape, dtype, device, repeats, skip_dict_repr)
-        print(
-            f"{n_layers:6d} | {len(keys):6d} | {row['mem_mb']} | {row['repr_ms']} | {row['str_ms']} | "
-            f"{row['pretty_ms']} | {row['repr_len']} | {row['dict_ms']} | {row['dict_len']}"
+        line = (
+            f"{n_layers:6d} | {len(keys):6d} | {row['mem_mb']} | {row['repr_ms']} | "
+            f"{row['str_ms']} | {row['pretty_ms']} | {row['repr_len']} | "
+            f"{row['dict_ms']} | {row['dict_len']}"
         )
+        print(line)
     print()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Probe real ActivationCache repr/display along tensor-size and key-count sweeps."
+        description="Probe real ActivationCache repr/display along tensor and key sweeps.",
     )
     parser.add_argument(
         "--mode",
@@ -246,12 +252,17 @@ def main() -> None:
         default="both",
         help="Which sweep(s) to run (default: both)",
     )
-    parser.add_argument("--layers", type=int, default=12, help="Fixed layers for tensor sweep (default: 12)")
+    parser.add_argument(
+        "--layers",
+        type=int,
+        default=12,
+        help="Fixed layers for tensor sweep (default: 12)",
+    )
     parser.add_argument(
         "--shapes",
         nargs="+",
         default=None,
-        help="Tensor shapes as DxDxD for tensor sweep (e.g. 1x4x8 1x32x256 2x128x768 4x256x1024)",
+        help="Tensor shapes as DxDxD for tensor sweep (e.g. 1x4x8 1x32x256 2x128x768)",
     )
     parser.add_argument(
         "--layer-counts",
@@ -267,8 +278,17 @@ def main() -> None:
     )
     parser.add_argument("--dtype", choices=sorted(DTYPE_MAP), default="float32")
     parser.add_argument("--device", default="cpu", help="Torch device (default: cpu)")
-    parser.add_argument("--repeats", type=int, default=5, help="Timed repeats per case (default: 5)")
-    parser.add_argument("--skip-dict-repr", action="store_true", help="Skip repr(cache.cache_dict)")
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=5,
+        help="Timed repeats per case (default: 5)",
+    )
+    parser.add_argument(
+        "--skip-dict-repr",
+        action="store_true",
+        help="Skip repr(cache.cache_dict)",
+    )
     parser.add_argument(
         "--print-threshold",
         type=int,
@@ -284,10 +304,11 @@ def main() -> None:
     dtype = DTYPE_MAP[args.dtype]
     shapes = parse_shapes(args.shapes)
     key_sweep_shape = parse_shape(args.key_sweep_shape)
+    pretty_status = "available" if ipython_pretty is not None else "not installed"
 
     print(f"ActivationCache source : {inspect.getsourcefile(ActivationCache)}")
     print(f"torch version          : {torch.__version__} (device={device}, dtype={dtype})")
-    print(f"IPython pretty         : {'available' if ipython_pretty is not None else 'not installed'}")
+    print(f"IPython pretty         : {pretty_status}")
     print()
 
     if args.mode in ("both", "tensors"):
