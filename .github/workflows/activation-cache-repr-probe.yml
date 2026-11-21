@@ -1,0 +1,51 @@
+name: ActivationCache Repr Probe
+
+on:
+  push:
+    branches:
+      - investigate/activation-cache-repr-1126
+  workflow_dispatch:
+
+jobs:
+  probe-and-checks:
+    runs-on: ubuntu-latest
+    env:
+      TRANSFORMERLENS_HF_RETRY: "1"
+      TL_FORCE_EXIT_AFTER_TESTS: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          activate-environment: true
+          enable-cache: true
+
+      - name: Install dependencies
+        id: deps
+        run: uv sync
+
+      - name: Format check (pycln, isort, black)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: |
+          uv run pycln --check .
+          uv run isort --check .
+          uv run black --check --diff .
+
+      - name: Type check (mypy)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: uv run mypy .
+
+      - name: Unit regression test (test_activation_cache_repr)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: uv run pytest tests/unit/test_activation_cache_repr.py -v
+
+      - name: Run ActivationCache repr probe (CPU)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: uv run python debugging/activation_cache_repr_probe.py
+
+      - name: Acceptance tests (test_activation_cache)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: uv run pytest tests/acceptance/test_activation_cache.py -v
